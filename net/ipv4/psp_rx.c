@@ -78,6 +78,9 @@ int __psp_dev_decapsulate(struct sk_buff *skb, u32 keygeneration, bool is_ipv4)
 	 */
 	const struct psphdr *ph;
 	unsigned int hdr_len;                       /* L2 + L3 header len */
+        const struct skb_shared_info *pinfo;
+        skb_frag_t *frag0;
+        unsigned char *ptr;
 
 	skb->psp.gen = keygeneration;
 
@@ -93,23 +96,37 @@ int __psp_dev_decapsulate(struct sk_buff *skb, u32 keygeneration, bool is_ipv4)
 		}
 		hdr_len = ETH_HLEN + sizeof(*iph);
 	} else {
-		struct ipv6hdr *ip6h = (struct ipv6hdr *)(skb->data + ETH_HLEN);
+            struct ipv6hdr *ip6h;
 
-		if (unlikely(ip6h->nexthdr != IPPROTO_TCP)) {
-			if (ip6h->nexthdr != IPPROTO_UDP)
-				return -1;
-			psp_adjust_iplen(&ip6h->payload_len);
-			ip6h->nexthdr = IPPROTO_TCP;
-		}
-		hdr_len = ETH_HLEN + sizeof(*ip6h);
+            if (skb_headlen(skb) == 0) {
+                // All the data is present in fragments.
+                // skb->data would be NULL.
+                pinfo = skb_shinfo(skb);
+                frag0 = &pinfo->frags[0];
+                ptr = skb_frag_address(frag0);
+                ip6h = (struct ipv6hdr *)(ptr + ETH_HLEN);
+                hdr_len = ETH_HLEN + sizeof(*ip6h);
+                ph = (struct psphdr *)(ptr + hdr_len + sizeof(struct udphdr));
+            } else {
+                ip6h = (struct ipv6hdr *)(skb->data);
+                hdr_len = sizeof(*ip6h);
+            }
+	    if (unlikely(ip6h->nexthdr != IPPROTO_TCP)) {
+		if (ip6h->nexthdr != IPPROTO_UDP)
+			return -1;
+                psp_adjust_iplen(&ip6h->payload_len);
+                ip6h->nexthdr = IPPROTO_TCP;
+            }
 	}
 
-	/* make sure we have sufficient headers in the skb. */
-	if (!pskb_may_pull(skb, hdr_len + PSP_ENCAP_HLEN +
+        if (skb_headlen(skb) != 0) {
+	    /* make sure we have sufficient headers in the skb. */
+	    if (!pskb_may_pull(skb, hdr_len + PSP_ENCAP_HLEN +
 			   sizeof(struct tcphdr)))
 		return -1;
 
-	ph = (struct psphdr *)(skb->data + hdr_len + sizeof(struct udphdr));
+	    ph = (struct psphdr *)(skb->data + hdr_len + sizeof(struct udphdr));
+        }
 	if (ph->nh != IPPROTO_TCP)
 		return -1;
 	skb->psp.spi = ph->spi;
@@ -120,8 +137,16 @@ int __psp_dev_decapsulate(struct sk_buff *skb, u32 keygeneration, bool is_ipv4)
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
 
 	/* remove PSP+UDP headers, adjust skb lengths */
-	memmove(skb->data + PSP_ENCAP_HLEN, skb->data, hdr_len);
-	__skb_pull(skb, PSP_ENCAP_HLEN);
+        if (skb_headlen(skb) == 0) {
+            memmove(ptr + PSP_ENCAP_HLEN, ptr, hdr_len);
+            skb->data_len -= PSP_ENCAP_HLEN;
+            skb_frag_off_add(frag0, PSP_ENCAP_HLEN);
+            skb_frag_size_sub(frag0, PSP_ENCAP_HLEN);
+            skb->len -= PSP_ENCAP_HLEN;
+        } else {
+            memmove(skb->data + PSP_ENCAP_HLEN, skb->data, hdr_len);
+            __skb_pull(skb, PSP_ENCAP_HLEN);
+        }
 	return 0;
 }
 EXPORT_SYMBOL(__psp_dev_decapsulate);

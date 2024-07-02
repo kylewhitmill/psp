@@ -877,6 +877,8 @@ struct sk_buff {
 #endif
 	__u8			slow_gro:1;
 
+	/* Set if TX packet pacing is offloaded to HW device. */
+	__u8                    pace_offload:1;
 #ifdef CONFIG_NET_SCHED
 	__u16			tc_index;	/* traffic control index */
 #endif

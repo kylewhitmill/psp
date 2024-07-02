@@ -922,6 +922,8 @@ enum {
 
 	TCA_FQ_HORIZON_DROP,	/* drop packets beyond horizon, or cap their EDT */
 
+	TCA_FQ_OFFLOAD_HORIZON, /* dequeue paced packets within NIC's horizon immediately */
+
 	__TCA_FQ_MAX
 };
 

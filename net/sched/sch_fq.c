@@ -105,6 +105,7 @@ struct fq_sched_data {
 
 	struct fq_flow	internal;	/* for non classified or high prio packets */
 	u32		quantum;
+	u32             offload_horizon; /* Google internal: hardware pacing offload horizon */
 	u32		initial_quantum;
 	u32		flow_refill_delay;
 	u32		flow_plimit;	/* max packets per flow */
@@ -501,15 +502,18 @@ static void fq_check_throttled(struct fq_sched_data *q, u64 now)
 	unsigned long sample;
 	struct rb_node *p;
 
-	if (q->time_next_delayed_flow > now)
+	if (q->time_next_delayed_flow > now + q->offload_horizon)
 		return;
 
 	/* Update unthrottle latency EWMA.
 	 * This is cheap and can help diagnosing timer/latency problems.
 	 */
 	sample = (unsigned long)(now - q->time_next_delayed_flow);
-	q->unthrottle_latency_ns -= q->unthrottle_latency_ns >> 3;
-	q->unthrottle_latency_ns += sample >> 3;
+	if (sample > 0ul) {
+		q->unthrottle_latency_ns -= q->unthrottle_latency_ns >> 3;
+		q->unthrottle_latency_ns += sample >> 3;
+        }
+	now += q->offload_horizon;
 
 	q->time_next_delayed_flow = ~0ULL;
 	while ((p = rb_first(&q->delayed)) != NULL) {
@@ -532,6 +536,7 @@ static struct sk_buff *fq_dequeue(struct Qdisc *sch)
 	unsigned long rate;
 	u32 plen;
 	u64 now;
+	u64 time_next_packet;
 
 	if (!sch->q.qlen)
 		return NULL;
@@ -567,10 +572,10 @@ begin:
 
 	skb = fq_peek(f);
 	if (skb) {
-		u64 time_next_packet = max_t(u64, fq_skb_cb(skb)->time_to_send,
+		time_next_packet = max_t(u64, fq_skb_cb(skb)->time_to_send,
 					     f->time_next_packet);
 
-		if (now < time_next_packet) {
+		if (now + q->offload_horizon < time_next_packet) {
 			head->first = f->next;
 			f->time_next_packet = time_next_packet;
 			fq_flow_set_throttled(q, f);
@@ -638,6 +643,8 @@ begin:
 			len -= min(len/2, now - f->time_next_packet);
 		f->time_next_packet = now + len;
 	}
+	if (now < time_next_packet)
+		skb->pace_offload = 1;
 out:
 	qdisc_bstats_update(sch, skb);
 	return skb;
@@ -797,6 +804,7 @@ static const struct nla_policy fq_policy[TCA_FQ_MAX + 1] = {
 	[TCA_FQ_TIMER_SLACK]		= { .type = NLA_U32 },
 	[TCA_FQ_HORIZON]		= { .type = NLA_U32 },
 	[TCA_FQ_HORIZON_DROP]		= { .type = NLA_U8 },
+	[TCA_FQ_OFFLOAD_HORIZON]        = { .type = NLA_U32 },
 };
 
 static int fq_change(struct Qdisc *sch, struct nlattr *opt,
@@ -804,6 +812,7 @@ static int fq_change(struct Qdisc *sch, struct nlattr *opt,
 {
 	struct fq_sched_data *q = qdisc_priv(sch);
 	struct nlattr *tb[TCA_FQ_MAX + 1];
+	struct net_device *dev = sch->dev_queue->dev;
 	int err, drop_count = 0;
 	unsigned drop_len = 0;
 	u32 fq_log;
@@ -893,6 +902,19 @@ static int fq_change(struct Qdisc *sch, struct nlattr *opt,
 	if (tb[TCA_FQ_HORIZON_DROP])
 		q->horizon_drop = nla_get_u8(tb[TCA_FQ_HORIZON_DROP]);
 
+	if (tb[TCA_FQ_OFFLOAD_HORIZON]) {
+		u32 offload_horizon = NSEC_PER_USEC * 
+			nla_get_u32(tb[TCA_FQ_OFFLOAD_HORIZON]);
+
+        	if (offload_horizon >= 0 &&
+                	offload_horizon <= dev->max_offload_horizon) {
+                       		q->offload_horizon = offload_horizon;
+               	} else {
+              		NL_SET_ERR_MSG_MOD(extack, "invalid offload_horizon");
+                	err = -EINVAL;
+		}
+	}
+
 	if (!err) {
 
 		sch_tree_unlock(sch);
@@ -950,6 +972,11 @@ static int fq_init(struct Qdisc *sch, struct nlattr *opt,
 	q->horizon = 10ULL * NSEC_PER_SEC; /* 10 seconds */
 	q->horizon_drop = 1; /* by default, drop packets beyond horizon */
 
+	q->offload_horizon = 0; /* by default, we assume no pacing offload */
+
+	/* XXX: Hard coding offload horizon to 256ms. */
+	q->offload_horizon = 256ull * NSEC_PER_MSEC;
+
 	/* Default ce_threshold of 4294 seconds */
 	q->ce_threshold		= (u64)NSEC_PER_USEC * ~0U;
 
@@ -968,6 +995,7 @@ static int fq_dump(struct Qdisc *sch, struct sk_buff *skb)
 	struct fq_sched_data *q = qdisc_priv(sch);
 	u64 ce_threshold = q->ce_threshold;
 	u64 horizon = q->horizon;
+	u64 offload_horizon = q->offload_horizon;
 	struct nlattr *opts;
 
 	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
@@ -978,6 +1006,7 @@ static int fq_dump(struct Qdisc *sch, struct sk_buff *skb)
 
 	do_div(ce_threshold, NSEC_PER_USEC);
 	do_div(horizon, NSEC_PER_USEC);
+	do_div(offload_horizon, NSEC_PER_USEC);
 
 	if (nla_put_u32(skb, TCA_FQ_PLIMIT, sch->limit) ||
 	    nla_put_u32(skb, TCA_FQ_FLOW_PLIMIT, q->flow_plimit) ||
@@ -995,7 +1024,8 @@ static int fq_dump(struct Qdisc *sch, struct sk_buff *skb)
 	    nla_put_u32(skb, TCA_FQ_BUCKETS_LOG, q->fq_trees_log) ||
 	    nla_put_u32(skb, TCA_FQ_TIMER_SLACK, q->timer_slack) ||
 	    nla_put_u32(skb, TCA_FQ_HORIZON, (u32)horizon) ||
-	    nla_put_u8(skb, TCA_FQ_HORIZON_DROP, q->horizon_drop))
+	    nla_put_u8(skb, TCA_FQ_HORIZON_DROP, q->horizon_drop) ||
+	    nla_put_u32(skb, TCA_FQ_OFFLOAD_HORIZON, (u32)offload_horizon))
 		goto nla_put_failure;
 
 	return nla_nest_end(skb, opts);

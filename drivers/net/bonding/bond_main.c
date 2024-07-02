@@ -1419,6 +1419,7 @@ static void bond_compute_features(struct bonding *bond)
 	unsigned short max_hard_header_len = ETH_HLEN;
 	unsigned int gso_max_size = GSO_MAX_SIZE;
 	u16 gso_max_segs = GSO_MAX_SEGS;
+	u32 max_offload_horizon = ~0U;
 
 	if (!bond_has_slaves(bond))
 		goto done;
@@ -1449,6 +1450,8 @@ static void bond_compute_features(struct bonding *bond)
 
 		gso_max_size = min(gso_max_size, slave->dev->gso_max_size);
 		gso_max_segs = min(gso_max_segs, slave->dev->gso_max_segs);
+		max_offload_horizon = min(max_offload_horizon, 
+				slave->dev->max_offload_horizon);
 	}
 	bond_dev->hard_header_len = max_hard_header_len;
 
@@ -1463,6 +1466,7 @@ done:
 	bond_dev->mpls_features = mpls_features;
 	bond_dev->gso_max_segs = gso_max_segs;
 	netif_set_gso_max_size(bond_dev, gso_max_size);
+	bond_dev->max_offload_horizon = max_offload_horizon;
 
 	bond_dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
 	if ((bond_dev->priv_flags & IFF_XMIT_DST_RELEASE_PERM) &&

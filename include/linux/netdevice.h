@@ -2093,6 +2093,12 @@ struct net_device {
 	unsigned char		nested_level;
 #endif
 
+	/* Maximum time in the future (in nanoseconds) the device can perform
+        * transmit pacing offload.
+        *
+        * Zero if unsupported.
+       	*/
+        unsigned int            max_offload_horizon;
 
 	/* Protocol-specific pointers */
 

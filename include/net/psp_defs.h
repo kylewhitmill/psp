@@ -33,7 +33,7 @@
  * offload HW may have a hardcoded value for this port.
  * Do not change this value.
  */
-#define PSP_UDP_DPORT 1000
+#define PSP_UDP_DPORT 1001
 #define PSP_SRC_PORT_MIN 0
 #define PSP_SRC_PORT_MAX 65535
 
